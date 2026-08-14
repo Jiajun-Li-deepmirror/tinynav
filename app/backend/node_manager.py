@@ -760,12 +760,21 @@ class BackendNode(Ros2NodeManager):
         return math.atan2(rot[1, 2], rot[0, 2])
 
     @staticmethod
-    def _nearest_pose(poses: dict, timestamp_ns: int):
+    def _pose_matrix(value):
+        """The 4x4 out of a stored pose. OdomPoseRecorder saves msg2np's return
+        verbatim, which is a (transform, velocity) tuple, while poses.npy holds a
+        bare matrix -- accept either."""
+        if isinstance(value, tuple):
+            value = value[0]
+        return np.asarray(value, dtype=float)
+
+    @classmethod
+    def _nearest_pose(cls, poses: dict, timestamp_ns: int):
         if not poses:
             return None, None
         items = [(int(key), pose) for key, pose in poses.items()]
         nearest_key, nearest_pose = min(items, key=lambda item: abs(item[0] - timestamp_ns))
-        return nearest_key, nearest_pose
+        return nearest_key, cls._pose_matrix(nearest_pose)
 
     def _generate_pois_from_marks(self, bag_path: str | None, map_path: str) -> bool:
         """Turn the recording's POI marks into the map's pois.json.
