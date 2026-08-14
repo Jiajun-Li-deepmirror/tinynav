@@ -267,7 +267,7 @@ class MapNode(Node):
         self.T_from_map_to_odom = None
 
         self.pois = {}
-        self.poi_yaws = {}  # index -> heading in map frame, or None if the POI has none
+        self.poi_yaws = {}  # index -> heading in map frame, None if the POI has none
         self.poi_index = -1
         self._nav_completed = False
         self._leg_initial_length: float | None = None
@@ -300,8 +300,6 @@ class MapNode(Node):
             keys = sorted([int (key) for key in self.pois.keys()])
             for index, key in enumerate(keys):
                 pois_dict[index] = np.array(self.pois[str(key)]["position"])
-                # Absent on maps built before POI headings existed; None means
-                # "arrive however you like" and leaves the target orientation alone.
                 yaw = self.pois[str(key)].get("yaw")
                 yaws[index] = None if yaw is None else float(yaw)
             self.pois = pois_dict
@@ -737,10 +735,9 @@ class MapNode(Node):
         target_position_in_odom = T[:3, :3] @ target_position + T[:3, 3]
         dummy_pose = np.eye(4)
         dummy_pose[:3, 3] = target_position_in_odom
-        # Carry the POI's heading in the orientation, rotated into odom like the
-        # position is. Left as identity when the POI has none: its forward axis
-        # is then world +Z, which projects to a zero XY heading, and that is the
-        # "no preference" signal planning_node checks for.
+        # POI heading in the orientation, rotated into odom like the position is.
+        # Identity when it has none: forward is then world +Z, which projects to a
+        # zero XY heading, and that is the "no preference" signal.
         target_yaw = self.poi_yaws.get(self.poi_index)
         if target_yaw is not None:
             dummy_pose[:3, :3] = T[:3, :3] @ yaw_to_camera_rotation(target_yaw)

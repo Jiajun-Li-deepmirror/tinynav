@@ -277,14 +277,92 @@ def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution, safet
         occ_points.append(closest_step_for_traj)
     return scores, occ_points
 
+# Simulated to (near-)completion, not a fixed short horizon, so collision
+# scoring covers the whole approach instead of just its first seconds.
+BEZIER_MAX_DURATION = 20.0  # seconds, dt=0.1 -> 200 steps
+
+
+def generate_bezier_trajectories(
+    init_p, init_q, target_p_xy, target_yaw,
+    duration=3.0, dt=0.1,
+    tensions=(0.3, 0.5, 0.7),
+    max_vx=0.5, decel_radius=0.5,
+    max_omega=np.pi / 3, heading_gain=2.0,
+    lookahead_dist=0.4, num_curve_samples=50,
+):
+    """Final-approach candidates tracking a cubic Bezier to (target_p_xy, target_yaw),
+    steered by pure-pursuit so the motion stays feasible for a nonholonomic robot."""
+    num_steps = int(duration / dt) + 1
+    q0 = quat_to_matrix(init_q)
+    p0_xy = np.asarray(init_p[:2], dtype=np.float64)
+    target_p_xy = np.asarray(target_p_xy, dtype=np.float64)
+    heading0 = float(np.arctan2(q0[1, 2], q0[0, 2]))
+
+    trajectories = []
+    params = []
+    detour_ratios = []
+    for tension in tensions:
+        chord = target_p_xy - p0_xy
+        L = max(float(np.linalg.norm(chord)), 1e-3)
+        P0, P3 = p0_xy, target_p_xy
+        P1 = P0 + np.array([np.cos(heading0), np.sin(heading0)]) * L * tension
+        P2 = P3 - np.array([np.cos(target_yaw), np.sin(target_yaw)]) * L * tension
+
+        ts = np.linspace(0.0, 1.0, num_curve_samples)
+        curve_pts = np.array([
+            (1 - t) ** 3 * P0 + 3 * (1 - t) ** 2 * t * P1 + 3 * (1 - t) * t ** 2 * P2 + t ** 3 * P3
+            for t in ts
+        ])
+        cum_len = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(curve_pts, axis=0), axis=1))])
+        total_len = float(cum_len[-1])
+        # how much longer than a straight line: tie-breaker between safe tensions
+        detour_ratios.append(total_len / L)
+
+        p_xy = p0_xy.copy()
+        q = q0.copy()
+        traj = np.empty((num_steps, 7))
+        first_param = np.array([0.0, 0.0])
+        progress_idx = 0  # curve-point search never looks backward (see below)
+        for i in range(num_steps):
+            # only from the furthest point reached: an unconstrained argmin can snap
+            # backward when the robot drifts off-path, spiking `remaining` back up
+            local_offsets = np.linalg.norm(curve_pts[progress_idx:] - p_xy, axis=1)
+            nearest_idx = progress_idx + int(np.argmin(local_offsets))
+            progress_idx = nearest_idx
+            remaining = max(total_len - cum_len[nearest_idx], 0.0)
+            if remaining > lookahead_dist:
+                look_idx = min(int(np.searchsorted(cum_len, cum_len[nearest_idx] + lookahead_dist)), num_curve_samples - 1)
+                to_look = curve_pts[look_idx] - p_xy
+                desired_heading = float(np.arctan2(to_look[1], to_look[0]))
+            else:
+                desired_heading = target_yaw
+            current_heading = float(np.arctan2(q[1, 2], q[0, 2]))
+            heading_err = float((desired_heading - current_heading + np.pi) % (2 * np.pi) - np.pi)
+            omega_cmd = float(np.clip(heading_gain * heading_err, -max_omega, max_omega))
+            vx = max_vx * float(np.clip(remaining / decel_radius, 0.0, 1.0))
+            # rotvec_to_matrix([0, x, 0]) turns current_heading the opposite sense of
+            # x, so negate here or heading_err never converges
+            omega_y = -omega_cmd
+            if i == 0:
+                first_param = np.array([vx, omega_y])
+
+            q = q @ rotvec_to_matrix(np.array([0.0, omega_y * dt, 0.0]))
+            p_xy = p_xy + (q @ np.array([0.0, 0.0, vx]))[:2] * dt
+
+            traj[i, 0:2] = p_xy
+            traj[i, 2] = init_p[2]
+            traj[i, 3:] = matrix_to_quat(q)
+
+        trajectories.append(traj)
+        params.append(first_param)
+
+    return np.asarray(trajectories), np.asarray(params), np.asarray(detour_ratios)
+
+
 def target_yaw_from_msg(msg):
     """The heading map_node put in a target pose, or None when it left one out.
-
-    A POI without a recorded heading is published with an identity orientation,
-    whose forward axis is world +Z and so has no XY direction at all -- that
-    degenerate projection is the "arrive however you like" signal, and it is
-    what tells the two apart.
-    """
+    A POI without one is published with an identity orientation, whose forward axis
+    is world +Z and so has no XY direction -- that is what tells the two apart."""
     q = msg.pose.pose.orientation
     fwd_x = 2.0 * (q.x * q.z + q.w * q.y)
     fwd_y = 2.0 * (q.y * q.z - q.w * q.x)
@@ -328,6 +406,8 @@ class PlanningNode(Node):
         )
         self.bridge = CvBridge()
         self.path_pub = self.create_publisher(Path, '/planning/trajectory_path', 10)
+        # trajectory_path carries whatever is followed, so this tells the two apart
+        self.bezier_path_pub = self.create_publisher(Path, '/planning/bezier_path', 10)
         self.height_map_pub = self.create_publisher(Image, "/planning/height_map", 10)
         self.obstacle_mask_pub = self.create_publisher(OccupancyGrid, '/planning/obstacle_mask', 10)
         self.footprint_pub = self.create_publisher(PointCloud, '/planning/footprint', 10)
@@ -358,6 +438,15 @@ class PlanningNode(Node):
 
         self.create_subscription(Odometry, '/control/target_pose', self.target_pose_callback, 10)
         self.target_pose = None
+        self.target_yaw = None
+        # engaged by range: that is when the end tangent starts to matter and when
+        # one curve can still describe the whole remaining path
+        self.bezier_engage_dist = 2.0  # m
+        self.bezier_max_vx = 0.5
+        self.bezier_max_omega = np.pi / 3
+        # the scorer returns 0 only while clear of safety_radius, so this rejects
+        # any curve that grazes -- the library's pick is still there as fallback
+        self.bezier_max_score = 1e-6
 
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
 
@@ -408,6 +497,27 @@ class PlanningNode(Node):
         msg.header.frame_id = "world"
         msg.points = points
         self.footprint_pub.publish(msg)
+
+    def publish_bezier_path(self, traj, stamp):
+        """Publish the curve being followed, separately from trajectory_path. None
+        clears it. Subsampled -- 200 steps is more than a viewer needs."""
+        path = Path()
+        path.header = Header()
+        path.header.stamp = stamp
+        path.header.frame_id = "world"
+        for j in range(0, 0 if traj is None else len(traj), 10):
+            x, y, z, qx, qy, qz, qw = traj[j]
+            pose = PoseStamped()
+            pose.header = path.header
+            pose.pose.position.x = float(x)
+            pose.pose.position.y = float(y)
+            pose.pose.position.z = float(z)
+            pose.pose.orientation.x = float(qx)
+            pose.pose.orientation.y = float(qy)
+            pose.pose.orientation.z = float(qz)
+            pose.pose.orientation.w = float(qw)
+            path.poses.append(pose)
+        self.bezier_path_pub.publish(path)
 
     def _front_obstacle_dist(self, T, obstacle_mask, max_dist=0.5):
         """Distance from the robot's front face to the nearest obstacle in the forward corridor.
@@ -580,6 +690,26 @@ class PlanningNode(Node):
             top_k = 100
             top_indices = np.argsort(scores, kind='stable')[:top_k]
 
+            # The library cannot express "arrive facing that way": its samples hold
+            # (vx, omega) constant, so any sample ending on the right heading is an
+            # arc that ends somewhere else. A Bezier pinned at both ends can.
+            bezier_trajs = None
+            bezier_scores = None
+            bezier_detours = None
+            if (self.target_yaw is not None and self.target_pose is not None
+                    and np.linalg.norm(init_p[:2] - self.target_pose[:2]) < self.bezier_engage_dist):
+                bezier_trajs, bezier_params, bezier_detours = generate_bezier_trajectories(
+                    init_p, init_q, self.target_pose[:2], self.target_yaw,
+                    duration=BEZIER_MAX_DURATION,
+                    max_vx=self.bezier_max_vx, max_omega=self.bezier_max_omega,
+                )
+                # same footprint scorer as the library: a curve that clips a wall
+                # is rejected on the same terms, not trusted for being smooth
+                bezier_scores, _ = score_trajectories_by_ESDF(
+                    bezier_trajs, ESDF_map, self.origin, self.resolution,
+                    self.robot.safety_radius, front_len, rear_len, half_w,
+                )
+
         with Timer(name='pub', text="[{name}] Elapsed time: {milliseconds:.0f} ms"):
             front_clearance = self._front_obstacle_dist(T, obstacle_mask)
             enter_threshold = 0.30
@@ -605,6 +735,25 @@ class PlanningNode(Node):
             top_indices = np.argsort(np.array([cost_function(trajectories[i], params[i], scores[i], self.target_pose) for i in range(len(trajectories))]), kind='stable')[:top_k]
             self.last_param = params[top_indices[0]]
 
+            # A clear curve wins outright: no library sample can both reach the goal
+            # and end on its heading, so competing on one cost would just hand it
+            # back to the arc that gets closest. Among curves least detour wins --
+            # they end at the same pose. All blocked, and the library's pick stands.
+            selected_traj = trajectories[top_indices[0]]
+            picked_curve = None
+            if bezier_trajs is not None:
+                clear = [i for i in range(len(bezier_trajs)) if np.isfinite(bezier_scores[i])
+                         and bezier_scores[i] < self.bezier_max_score]
+                if clear:
+                    pick = min(clear, key=lambda i: bezier_detours[i])
+                    picked_curve = bezier_trajs[pick]
+                    selected_traj = picked_curve
+                    # next cycle's smoothness term compares against what was commanded
+                    self.last_param = bezier_params[pick]
+            # published every cycle, empty when no curve is in play, so a stale one
+            # does not sit on the map after the approach ends
+            self.publish_bezier_path(picked_curve, depth_msg.header.stamp)
+
             # path
             path = Path()
             path.header = depth_msg.header
@@ -617,19 +766,18 @@ class PlanningNode(Node):
                 self.get_logger().info('All trajectories in collision, stopping path.')
                 return
 
-            for i in top_indices:
-                for j in range(0, len(trajectories[i]), 10):
-                    x,y,z,qx,qy,qz,qw = trajectories[i][j]
-                    pose = PoseStamped()
-                    pose.header = depth_msg.header
-                    pose.pose.position.x = x
-                    pose.pose.position.y = y
-                    pose.pose.position.z = z
-                    pose.pose.orientation.x = qx
-                    pose.pose.orientation.y = qy
-                    pose.pose.orientation.z = qz
-                    pose.pose.orientation.w = qw
-                    path.poses.append(pose)
+            for j in range(0, len(selected_traj), 10):
+                x,y,z,qx,qy,qz,qw = selected_traj[j]
+                pose = PoseStamped()
+                pose.header = depth_msg.header
+                pose.pose.position.x = x
+                pose.pose.position.y = y
+                pose.pose.position.z = z
+                pose.pose.orientation.x = qx
+                pose.pose.orientation.y = qy
+                pose.pose.orientation.z = qz
+                pose.pose.orientation.w = qw
+                path.poses.append(pose)
             self.path_pub.publish(path)
 
 def main(args=None):

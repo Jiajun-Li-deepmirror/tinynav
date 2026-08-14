@@ -8,8 +8,6 @@ router = APIRouter(tags=['bag'])
 
 class PoiMarkRequest(BaseModel):
     name: str
-    # Defaults to the live pose's own stamp; supplied only when a caller is
-    # marking a moment it observed earlier than the request.
     timestamp_ns: int | None = None
 
 
@@ -54,7 +52,6 @@ def bag_status():
 
 @router.post('/poi-marks')
 def bag_poi_mark(req: PoiMarkRequest):
-    """Mark the robot's current position and heading into the running bag."""
     node = _require_node()
     if node.state != 'realsense_bag_record':
         raise HTTPException(409, 'POI marks can only be recorded while bag recording')
