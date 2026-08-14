@@ -38,6 +38,8 @@ _MAP_BUILD_DOMAIN_LOOPER = '231'  # isolated domain to avoid live looper topic c
 # build_map_node.py emits "MAPPING_PERCENT:<float>" lines on stdout so the
 # parent process can track progress without a separate bridge subprocess.
 _MAPPING_PERCENT_PREFIX = 'MAPPING_PERCENT:'
+# Written into the bag folder, so marks travel with the recording they belong to.
+_POI_MARKS_FILE = 'poi_marks.json'
 
 _COLOR_TOPIC_REALSENSE = '/camera/camera/color/image_raw'
 _COLOR_TOPIC_LOOPER = '/camera/camera/color/image_rect_raw/compressed'
@@ -684,7 +686,153 @@ class BackendNode(Ros2NodeManager):
             'navNodesRunning': nav_nodes,
             'navPaused': nav_paused,
             'navActive': nav_active,
+            'poiMarkCount': self.get_poi_mark_count(),
         }
+
+    # --- POI marks -------------------------------------------------------
+    # Marked live during a recording, resolved to map coordinates at build
+    # time. See _generate_pois_from_marks for why the timestamp is the part
+    # that matters.
+
+    def _poi_marks_path(self, bag_path: str | None = None) -> str:
+        return os.path.join(bag_path or self.bag_path, _POI_MARKS_FILE)
+
+    def _load_poi_marks(self, bag_path: str | None = None) -> list[dict]:
+        path = self._poi_marks_path(bag_path)
+        if not os.path.exists(path):
+            return []
+        try:
+            with open(path) as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return []
+        return data if isinstance(data, list) else []
+
+    def _save_poi_marks(self, marks: list[dict], bag_path: str | None = None):
+        path = self._poi_marks_path(bag_path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'w') as f:
+            json.dump(marks, f, indent=2)
+
+    def get_poi_mark_count(self, bag_path: str | None = None) -> int:
+        return len(self._load_poi_marks(bag_path))
+
+    def record_poi_mark(self, name: str, timestamp_ns: int | None = None) -> dict:
+        """Mark a POI at the robot's current pose while a bag is recording.
+
+        Stores the live pose so the mark is usable even if the map is never
+        built, and the timestamp so map build can do better (see
+        _generate_pois_from_marks).
+        """
+        clean_name = name.strip()
+        if not clean_name:
+            raise ValueError('POI name is required')
+        with self._lock:
+            pose = dict(self._odom_pose) if self._odom_pose else None
+        if pose is None:
+            raise ValueError('No live SLAM pose available yet')
+        if not os.path.isdir(self.bag_path):
+            raise ValueError('Bag directory is not ready yet')
+        if timestamp_ns is None:
+            timestamp_ns = int(round(pose['timestamp'] * 1e9))
+
+        marks = self._load_poi_marks()
+        mark = {
+            'id': len(marks),
+            'name': clean_name,
+            'timestamp_ns': int(timestamp_ns),
+            'position': [pose['x'], pose['y'], pose['z']],
+            'yaw': pose['yaw'],
+            'created_at': time.time(),
+        }
+        marks.append(mark)
+        self._save_poi_marks(marks)
+        self.get_logger().info(
+            f"Recorded POI mark {clean_name} at "
+            f"({pose['x']:.2f}, {pose['y']:.2f}), yaw={math.degrees(pose['yaw']):.1f} deg"
+        )
+        return mark
+
+    @staticmethod
+    def _yaw_from_matrix(rot: np.ndarray) -> float:
+        """Heading from a camera-convention rotation matrix (camera Z = forward),
+        matching the projection _odom_to_dict uses for live pose yaw."""
+        return math.atan2(rot[1, 2], rot[0, 2])
+
+    @staticmethod
+    def _nearest_pose(poses: dict, timestamp_ns: int):
+        if not poses:
+            return None, None
+        items = [(int(key), pose) for key, pose in poses.items()]
+        nearest_key, nearest_pose = min(items, key=lambda item: abs(item[0] - timestamp_ns))
+        return nearest_key, nearest_pose
+
+    def _generate_pois_from_marks(self, bag_path: str | None, map_path: str) -> bool:
+        """Turn the recording's POI marks into the map's pois.json.
+
+        The live pose a mark was captured with is in the odometry frame at
+        record time, which loop closure later corrects. Rather than freeze it,
+        the mark's timestamp is used to look up its nearest keyframe and
+        replay that keyframe's correction onto the mark:
+
+            corrected = optimized_keyframe @ inv(raw_keyframe) @ raw_mark
+
+        so a mark laid down before a loop closes still lands where it belongs
+        afterwards. Falls back to the live capture when the map lacks the pose
+        files to do this.
+        """
+        if bag_path is None:
+            return False
+        marks = self._load_poi_marks(bag_path)
+        if not marks:
+            return False
+
+        optimized_poses: dict = {}
+        continuous_poses: dict = {}
+        poses_path = os.path.join(map_path, 'poses.npy')
+        if os.path.exists(poses_path):
+            try:
+                optimized_poses = np.load(poses_path, allow_pickle=True).item()
+                continuous_path = os.path.join(map_path, 'mapping_continuous_odom.npy')
+                if os.path.exists(continuous_path):
+                    continuous_poses = np.load(continuous_path, allow_pickle=True).item()
+            except Exception as e:
+                self.get_logger().warn(f'Cannot load map poses for POI marks: {e}')
+                optimized_poses = {}
+                continuous_poses = {}
+
+        pois: dict[str, dict] = {}
+        for mark in marks:
+            timestamp_ns = int(mark.get('timestamp_ns', 0))
+            position = mark.get('position', [0.0, 0.0, 0.0])
+            yaw = float(mark.get('yaw', 0.0))
+
+            keyframe_ts, optimized_keyframe_pose = self._nearest_pose(optimized_poses, timestamp_ns)
+            if keyframe_ts is not None:
+                mark_ts, raw_mark_pose = self._nearest_pose(continuous_poses, timestamp_ns)
+                raw_key_ts, raw_keyframe_pose = self._nearest_pose(continuous_poses, keyframe_ts)
+                if mark_ts is not None and raw_key_ts is not None:
+                    try:
+                        corrected = optimized_keyframe_pose @ np.linalg.inv(raw_keyframe_pose) @ raw_mark_pose
+                        position = [float(v) for v in corrected[:3, 3]]
+                        yaw = self._yaw_from_matrix(corrected[:3, :3])
+                    except Exception as e:
+                        self.get_logger().warn(
+                            f'Failed to correct POI mark pose, using live capture: {e}'
+                        )
+
+            poi_id = len(pois)
+            pois[str(poi_id)] = {
+                'id': poi_id,
+                'name': str(mark.get('name') or f'poi_{poi_id + 1}'),
+                'position': position,
+                'yaw': yaw,
+            }
+
+        with open(os.path.join(map_path, 'pois.json'), 'w') as f:
+            json.dump(pois, f, indent=2)
+        self.get_logger().info(f'Wrote {len(pois)} POIs from bag marks')
+        return True
 
     @staticmethod
     def _derive_map_status(raw: str, pct: float, files_exist: bool) -> str:
@@ -985,6 +1133,8 @@ class BackendNode(Ros2NodeManager):
         """Wait for build_map to finish, then convert, archive, and restart."""
         import shutil
         from datetime import datetime
+        # Captured before the run tears state down; the marks live in the bag.
+        active_bag = self.active_bag_path
         proc_build = self.processes.get('build_map')
         if proc_build:
             proc_build.wait()
@@ -1001,16 +1151,20 @@ class BackendNode(Ros2NodeManager):
         shutil.move(self.map_path, dest)
         os.symlink(dest, self.map_path)
 
-        # Auto-create a home POI at the SLAM origin (0,0,0) if none exist.
-        # map_node requires at least one POI as a global localization anchor.
-        pois_path = os.path.join(dest, 'pois.json')
-        if not os.path.exists(pois_path):
-            with open(pois_path, 'w') as _f:
-                json.dump(
-                    {'0': {'id': 0, 'name': 'home', 'position': [0.0, 0.0, 0.0]}},
-                    _f, indent=2,
-                )
-            self.get_logger().info('Auto-created home POI at (0,0,0)')
+        # POI marks from the recording win: they are real places the operator
+        # stood at, with a heading. Only when there are none does the origin
+        # placeholder below apply.
+        if not self._generate_pois_from_marks(active_bag, dest):
+            # Auto-create a home POI at the SLAM origin (0,0,0) if none exist.
+            # map_node requires at least one POI as a global localization anchor.
+            pois_path = os.path.join(dest, 'pois.json')
+            if not os.path.exists(pois_path):
+                with open(pois_path, 'w') as _f:
+                    json.dump(
+                        {'0': {'id': 0, 'name': 'home', 'position': [0.0, 0.0, 0.0]}},
+                        _f, indent=2,
+                    )
+                self.get_logger().info('Auto-created home POI at (0,0,0)')
 
         self._stop_all()
         self.state = 'idle'
