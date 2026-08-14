@@ -214,9 +214,7 @@ def map_preview_create_poi(map_name: str, req: MapPoiCreateRequest):
             pois = json.load(f)
     existing_ids = [int(k) for k in pois.keys()] if pois else []
     new_id = max(existing_ids) + 1 if existing_ids else 0
-    # A hand-placed POI carries no heading of its own, so it gets 0 rather than
-    # being left out: every POI then has the field, and the map draws it facing
-    # +X until someone gives it a real one.
+    # hand-placed: no heading of its own, so 0 rather than absent
     pois[str(new_id)] = {
         'id': new_id, 'name': req.name, 'position': snapped_position, 'yaw': 0.0,
     }

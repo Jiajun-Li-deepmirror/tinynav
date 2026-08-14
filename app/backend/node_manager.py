@@ -38,8 +38,7 @@ _MAP_BUILD_DOMAIN_LOOPER = '231'  # isolated domain to avoid live looper topic c
 # build_map_node.py emits "MAPPING_PERCENT:<float>" lines on stdout so the
 # parent process can track progress without a separate bridge subprocess.
 _MAPPING_PERCENT_PREFIX = 'MAPPING_PERCENT:'
-# Written into the bag folder, so marks travel with the recording they belong to.
-_POI_MARKS_FILE = 'poi_marks.json'
+_POI_MARKS_FILE = 'poi_marks.json'  # in the bag folder, so marks travel with it
 
 _COLOR_TOPIC_REALSENSE = '/camera/camera/color/image_raw'
 _COLOR_TOPIC_LOOPER = '/camera/camera/color/image_rect_raw/compressed'
@@ -689,11 +688,6 @@ class BackendNode(Ros2NodeManager):
             'poiMarkCount': self.get_poi_mark_count(),
         }
 
-    # --- POI marks -------------------------------------------------------
-    # Marked live during a recording, resolved to map coordinates at build
-    # time. See _generate_pois_from_marks for why the timestamp is the part
-    # that matters.
-
     def _poi_marks_path(self, bag_path: str | None = None) -> str:
         return os.path.join(bag_path or self.bag_path, _POI_MARKS_FILE)
 
@@ -718,12 +712,9 @@ class BackendNode(Ros2NodeManager):
         return len(self._load_poi_marks(bag_path))
 
     def record_poi_mark(self, name: str, timestamp_ns: int | None = None) -> dict:
-        """Mark a POI at the robot's current pose while a bag is recording.
-
-        Stores the live pose so the mark is usable even if the map is never
-        built, and the timestamp so map build can do better (see
-        _generate_pois_from_marks).
-        """
+        """Mark a POI at the robot's current pose while a bag is recording. Stores the
+        live pose so the mark works without a map, and the timestamp so map build can
+        do better -- see _generate_pois_from_marks."""
         clean_name = name.strip()
         if not clean_name:
             raise ValueError('POI name is required')
@@ -755,15 +746,13 @@ class BackendNode(Ros2NodeManager):
 
     @staticmethod
     def _yaw_from_matrix(rot: np.ndarray) -> float:
-        """Heading from a camera-convention rotation matrix (camera Z = forward),
-        matching the projection _odom_to_dict uses for live pose yaw."""
+        """Heading from a camera-convention rotation, as _odom_to_dict projects it."""
         return math.atan2(rot[1, 2], rot[0, 2])
 
     @staticmethod
     def _pose_matrix(value):
-        """The 4x4 out of a stored pose. OdomPoseRecorder saves msg2np's return
-        verbatim, which is a (transform, velocity) tuple, while poses.npy holds a
-        bare matrix -- accept either."""
+        """The 4x4 out of a stored pose: OdomPoseRecorder saves msg2np's
+        (transform, velocity) tuple, poses.npy a bare matrix."""
         if isinstance(value, tuple):
             value = value[0]
         return np.asarray(value, dtype=float)
@@ -779,16 +768,11 @@ class BackendNode(Ros2NodeManager):
     def _generate_pois_from_marks(self, bag_path: str | None, map_path: str) -> bool:
         """Turn the recording's POI marks into the map's pois.json.
 
-        The live pose a mark was captured with is in the odometry frame at
-        record time, which loop closure later corrects. Rather than freeze it,
-        the mark's timestamp is used to look up its nearest keyframe and
-        replay that keyframe's correction onto the mark:
-
-            corrected = optimized_keyframe @ inv(raw_keyframe) @ raw_mark
-
-        so a mark laid down before a loop closes still lands where it belongs
-        afterwards. Falls back to the live capture when the map lacks the pose
-        files to do this.
+        A mark's live pose is in the odometry frame at record time, which loop closure
+        later corrects. Its timestamp finds the nearest keyframe, whose correction is
+        replayed onto it as optimized_keyframe @ inv(raw_keyframe) @ raw_mark, so a
+        mark laid down before a loop closes still lands right. Falls back to the live
+        capture when the map lacks the pose files for that.
         """
         if bag_path is None:
             return False

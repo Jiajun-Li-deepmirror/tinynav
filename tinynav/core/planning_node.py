@@ -277,14 +277,23 @@ def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution, safet
         occ_points.append(closest_step_for_traj)
     return scores, occ_points
 
+@njit(cache=True)
+def end_yaw_error(traj_end, target_yaw):
+    """Absolute error between a trajectory's end heading and target_yaw."""
+    qx, qy, qz, qw = traj_end[3], traj_end[4], traj_end[5], traj_end[6]
+
+    # world XY forward from quaternion (body +Z forward)
+    fwd_x = 2.0 * (qx * qz + qw * qy)
+    fwd_y = 2.0 * (qy * qz - qw * qx)
+    want_x = np.cos(target_yaw)
+    want_y = np.sin(target_yaw)
+    return abs(np.arctan2(fwd_x * want_y - fwd_y * want_x, fwd_x * want_x + fwd_y * want_y))
+
+
 def target_yaw_from_msg(msg):
     """The heading map_node put in a target pose, or None when it left one out.
-
-    A POI without a recorded heading is published with an identity orientation,
-    whose forward axis is world +Z and so has no XY direction at all -- that
-    degenerate projection is the "arrive however you like" signal, and it is
-    what tells the two apart.
-    """
+    A POI without one is published with an identity orientation, whose forward axis
+    is world +Z and so has no XY direction -- that is what tells the two apart."""
     q = msg.pose.pose.orientation
     fwd_x = 2.0 * (q.x * q.z + q.w * q.y)
     fwd_y = 2.0 * (q.y * q.z - q.w * q.x)
@@ -358,6 +367,13 @@ class PlanningNode(Node):
 
         self.create_subscription(Odometry, '/control/target_pose', self.target_pose_callback, 10)
         self.target_pose = None
+        self.target_yaw = None
+        # wider than map_node's ~0.5 m arrival radius, so the turn starts as the
+        # robot settles rather than after it has stopped
+        self.arrival_yaw_band = 0.8  # m
+        # inside the band the distance spread is a few cm, so this has to outweigh
+        # the 100/m distance term by a lot to decide anything
+        self.w_target_yaw = 800.0
 
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
 
@@ -599,7 +615,16 @@ class PlanningNode(Node):
                 target_end = target_pose if target_pose is not None else traj_end
                 dist = np.linalg.norm(traj_end - target_end)
 
-                return score * 100000 + 100 * dist + 10 * abs(self.last_param[0] - param[0]) + 10 * abs(self.last_param[1] - param[1]) + reverse_gate_penalty
+                # Only from inside the arrival band: further out this fights the
+                # distance term and steers along the final heading instead of toward
+                # the goal. Inside it distance is nearly flat, and the vx=0 samples
+                # all share an endpoint, so heading alone picks the turn.
+                yaw_cost = 0.0
+                if (self.target_yaw is not None and target_pose is not None
+                        and dist < self.arrival_yaw_band):
+                    yaw_cost = self.w_target_yaw * end_yaw_error(traj[-1], self.target_yaw)
+
+                return score * 100000 + 100 * dist + yaw_cost + 10 * abs(self.last_param[0] - param[0]) + 10 * abs(self.last_param[1] - param[1]) + reverse_gate_penalty
 
             top_k = 1
             top_indices = np.argsort(np.array([cost_function(trajectories[i], params[i], scores[i], self.target_pose) for i in range(len(trajectories))]), kind='stable')[:top_k]

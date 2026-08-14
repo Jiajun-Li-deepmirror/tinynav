@@ -4,9 +4,8 @@ POI management — reads/writes pois.json in the map directory.
 pois.json schema:
   { "<id_str>": {"id": int, "name": str, "position": [x, y, z], "yaw": float} }
 
-yaw is the heading in radians. POIs recorded from a live pose during bag
-recording carry the real one; hand-placed POIs get 0. It is absent entirely on
-maps built before the field existed, so readers must tolerate that.
+yaw is radians, 0 for hand-placed POIs and absent on maps built before it
+existed, so readers must tolerate it missing.
 """
 from __future__ import annotations
 
@@ -73,7 +72,7 @@ def create_poi(req: PoiCreateRequest):
         'id': new_id,
         'name': req.name,
         'position': req.position,
-        'yaw': 0.0,  # hand-placed: no heading of its own, see map_preview_create_poi
+        'yaw': 0.0,  # hand-placed: no heading of its own
     }
     _save_pois(node, pois)
     return pois[str(new_id)]
