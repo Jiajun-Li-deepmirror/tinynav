@@ -1,7 +1,16 @@
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+
 from ..state import runner
 
 router = APIRouter(tags=['bag'])
+
+
+class PoiMarkRequest(BaseModel):
+    name: str
+    # Defaults to the live pose's own stamp; supplied only when a caller is
+    # marking a moment it observed earlier than the request.
+    timestamp_ns: int | None = None
 
 
 def _require_node():
@@ -39,4 +48,18 @@ def bag_status():
         'status': 'recording' if node.state == 'realsense_bag_record' else 'idle',
         'bagFileReady': os.path.exists(bag_file),
         'bagPath': node.bag_path,
+        'poiMarkCount': node.get_poi_mark_count(),
     }
+
+
+@router.post('/poi-marks')
+def bag_poi_mark(req: PoiMarkRequest):
+    """Mark the robot's current position and heading into the running bag."""
+    node = _require_node()
+    if node.state != 'realsense_bag_record':
+        raise HTTPException(409, 'POI marks can only be recorded while bag recording')
+    try:
+        mark = node.record_poi_mark(req.name, req.timestamp_ns)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {'ok': True, 'mark': mark, 'count': node.get_poi_mark_count()}

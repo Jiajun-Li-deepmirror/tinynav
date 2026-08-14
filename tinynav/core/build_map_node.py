@@ -608,7 +608,11 @@ class BuildMapNode(Node):
         self.keyframe_image_sub = Subscriber(self, Image, '/slam/keyframe_image')
         self.keyframe_odom_sub = Subscriber(self, Odometry, '/slam/keyframe_odom')
         self.rgb_image_sub = Subscriber(self, Image, '/camera/camera/color/image_raw')
-        self.continuous_odom_sub = self.create_subscription(Odometry, '/slam/odometry', self.continuous_odom_callback, 100)
+        # /slam/odometry comes from imu_propagator_node, which offline map build does
+        # not launch (perception_node + this node only), so subscribing to it here
+        # recorded nothing and mapping_continuous_odom.npy was never written.
+        # perception_node publishes /slam/odometry_visual on every frame regardless.
+        self.continuous_odom_sub = self.create_subscription(Odometry, '/slam/odometry_visual', self.continuous_odom_callback, 100)
 
         self.marker_pub = self.create_publisher(MarkerArray, '/mapping/pointcloud_markers', 10)
         self.local_map_pub = self.create_publisher(PointCloud2, "/mapping/local_map", 10)
