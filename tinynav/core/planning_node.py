@@ -277,6 +277,22 @@ def score_trajectories_by_ESDF(trajectories, ESDF_map, origin, resolution, safet
         occ_points.append(closest_step_for_traj)
     return scores, occ_points
 
+def target_yaw_from_msg(msg):
+    """The heading map_node put in a target pose, or None when it left one out.
+
+    A POI without a recorded heading is published with an identity orientation,
+    whose forward axis is world +Z and so has no XY direction at all -- that
+    degenerate projection is the "arrive however you like" signal, and it is
+    what tells the two apart.
+    """
+    q = msg.pose.pose.orientation
+    fwd_x = 2.0 * (q.x * q.z + q.w * q.y)
+    fwd_y = 2.0 * (q.y * q.z - q.w * q.x)
+    if fwd_x * fwd_x + fwd_y * fwd_y < 1e-12:
+        return None
+    return float(np.arctan2(fwd_y, fwd_x))
+
+
 def roll_occupancy_grid(occupancy_grid, old_origin, new_origin, resolution):
     shift_m = new_origin - old_origin
     shift_voxels = np.round(shift_m / resolution).astype(int)
@@ -347,9 +363,11 @@ class PlanningNode(Node):
 
     def poi_change_callback(self, msg):
         self.target_pose = None
+        self.target_yaw = None
 
     def target_pose_callback(self, msg):
         self.target_pose = np.array([msg.pose.pose.position.x, msg.pose.pose.position.y, msg.pose.pose.position.z])
+        self.target_yaw = target_yaw_from_msg(msg)
 
     def info_callback(self, msg):
         if self.K is None:

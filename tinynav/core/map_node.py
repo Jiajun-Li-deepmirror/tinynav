@@ -10,7 +10,7 @@ import sys
 import json
 
 import heapq
-from tinynav.core.math_utils import matrix_to_quat, msg2np, np2msg, estimate_pose, np2tf, rerank_by_pnp_inliers
+from tinynav.core.math_utils import matrix_to_quat, msg2np, np2msg, estimate_pose, np2tf, rerank_by_pnp_inliers, yaw_to_camera_rotation
 from sensor_msgs.msg import Image, CameraInfo
 from message_filters import TimeSynchronizer, Subscriber
 from cv_bridge import CvBridge
@@ -267,6 +267,7 @@ class MapNode(Node):
         self.T_from_map_to_odom = None
 
         self.pois = {}
+        self.poi_yaws = {}  # index -> heading in map frame, or None if the POI has none
         self.poi_index = -1
         self._nav_completed = False
         self._leg_initial_length: float | None = None
@@ -295,10 +296,16 @@ class MapNode(Node):
             self.pois = json.loads(msg.data)
 
             pois_dict = {}
+            yaws = {}
             keys = sorted([int (key) for key in self.pois.keys()])
             for index, key in enumerate(keys):
                 pois_dict[index] = np.array(self.pois[str(key)]["position"])
+                # Absent on maps built before POI headings existed; None means
+                # "arrive however you like" and leaves the target orientation alone.
+                yaw = self.pois[str(key)].get("yaw")
+                yaws[index] = None if yaw is None else float(yaw)
             self.pois = pois_dict
+            self.poi_yaws = yaws
 
             if not self.pois:
                 self.poi_index = -1
@@ -730,6 +737,13 @@ class MapNode(Node):
         target_position_in_odom = T[:3, :3] @ target_position + T[:3, 3]
         dummy_pose = np.eye(4)
         dummy_pose[:3, 3] = target_position_in_odom
+        # Carry the POI's heading in the orientation, rotated into odom like the
+        # position is. Left as identity when the POI has none: its forward axis
+        # is then world +Z, which projects to a zero XY heading, and that is the
+        # "no preference" signal planning_node checks for.
+        target_yaw = self.poi_yaws.get(self.poi_index)
+        if target_yaw is not None:
+            dummy_pose[:3, :3] = T[:3, :3] @ yaw_to_camera_rotation(target_yaw)
         self.target_pose_pub.publish(np2msg(dummy_pose, self.get_clock().now().to_msg(), "world", "camera"))
         self.tf_broadcaster.sendTransform(np2tf(T, self.get_clock().now().to_msg(), "world", "map"))
 

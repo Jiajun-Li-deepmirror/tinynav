@@ -310,3 +310,20 @@ def uf_all_sets_list(uf, min_component_size=1):
         if part.size >= int(min_component_size):
             out.append(np.sort(part).tolist())
     return out
+
+
+def yaw_to_camera_rotation(yaw):
+    """Rotation whose forward axis points along `yaw` in the world XY plane.
+
+    Inverse of the projection used everywhere a heading is read back out
+    (atan2(R[1, 2], R[0, 2])): SLAM poses are camera-convention, so forward is
+    the third column, not the first. Built with the camera's down axis pinned to
+    world -Z, which is the upright attitude a planar heading implies.
+    """
+    c = np.cos(yaw)
+    s = np.sin(yaw)
+    R_out = np.empty((3, 3))
+    R_out[:, 0] = np.array([s, -c, 0.0])   # right  = down x forward
+    R_out[:, 1] = np.array([0.0, 0.0, -1.0])  # down
+    R_out[:, 2] = np.array([c, s, 0.0])    # forward
+    return R_out
