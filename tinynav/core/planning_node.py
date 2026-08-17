@@ -360,9 +360,8 @@ def generate_bezier_trajectories(
 
 
 def target_yaw_from_msg(msg):
-    """The heading map_node put in a target pose, or None when it left one out.
-    A POI without one is published with an identity orientation, whose forward axis
-    is world +Z and so has no XY direction -- that is what tells the two apart."""
+    """Target heading from map_node, or None if the POI has none (identity
+    orientation, whose forward axis has no XY component)."""
     q = msg.pose.pose.orientation
     fwd_x = 2.0 * (q.x * q.z + q.w * q.y)
     fwd_y = 2.0 * (q.y * q.z - q.w * q.x)
@@ -439,14 +438,10 @@ class PlanningNode(Node):
         self.create_subscription(Odometry, '/control/target_pose', self.target_pose_callback, 10)
         self.target_pose = None
         self.target_yaw = None
-        # engaged by range: that is when the end tangent starts to matter and when
-        # one curve can still describe the whole remaining path
-        self.bezier_engage_dist = 2.0  # m
+        self.bezier_engage_dist = 2.0  # m, curve range where the end tangent still matters
         self.bezier_max_vx = 0.5
         self.bezier_max_omega = np.pi / 3
-        # the scorer returns 0 only while clear of safety_radius, so this rejects
-        # any curve that grazes -- the library's pick is still there as fallback
-        self.bezier_max_score = 1e-6
+        self.bezier_max_score = 1e-6  # curve must clear safety_radius entirely
 
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
 
