@@ -103,6 +103,8 @@ class Ros2UnitreeManagerNode(Node):
             action_key = msg.data.split(" ")[1]
             if action_key == "sit":
                 if self.is_quadruped:
+                    code0 = self.sport_client.StandUp()
+                    time.sleep(0.5)
                     code = self.sport_client.StandDown()
                     self.logger.info(f"Sitting: StandDown code={code}")
                 else:
