@@ -68,6 +68,8 @@ B2_CONFIG = RobotConfig(
     camera_x=0.3, camera_y=0.0,
     control_x=0.0, control_y=0.0,
     safety_radius=0.1,
+    min_linear_vel=0.2,min_angular_vel=0.3,
+    max_linear_vel=1.2,max_angular_vel=0.75
 )
 
 B2W_CONFIG = RobotConfig(
