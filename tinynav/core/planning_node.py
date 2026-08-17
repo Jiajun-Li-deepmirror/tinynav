@@ -439,8 +439,8 @@ class PlanningNode(Node):
         self.target_pose = None
         self.target_yaw = None
         self.bezier_engage_dist = 2.0  # m, curve range where the end tangent still matters
-        self.bezier_max_vx = 0.5
-        self.bezier_max_omega = np.pi / 3
+        self.bezier_max_vx = ROBOT_CONFIG.max_linear_vel
+        self.bezier_max_omega = ROBOT_CONFIG.max_angular_vel
         self.bezier_max_score = 1e-6  # curve must clear safety_radius entirely
 
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
