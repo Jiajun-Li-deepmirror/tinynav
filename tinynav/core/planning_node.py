@@ -494,8 +494,7 @@ class PlanningNode(Node):
         self.footprint_pub.publish(msg)
 
     def publish_bezier_path(self, traj, stamp):
-        """Publish the curve being followed, separately from trajectory_path. None
-        clears it. Subsampled -- 200 steps is more than a viewer needs."""
+        """Publish the curve being followed, separately from trajectory_path. None clears it."""
         path = Path()
         path.header = Header()
         path.header.stamp = stamp
@@ -685,9 +684,8 @@ class PlanningNode(Node):
             top_k = 100
             top_indices = np.argsort(scores, kind='stable')[:top_k]
 
-            # The library cannot express "arrive facing that way": its samples hold
-            # (vx, omega) constant, so any sample ending on the right heading is an
-            # arc that ends somewhere else. A Bezier pinned at both ends can.
+            # Library samples hold (vx, omega) constant, so none can arrive on an
+            # arbitrary heading; a Bezier pinned at both ends can.
             bezier_trajs = None
             bezier_scores = None
             bezier_detours = None
@@ -730,10 +728,8 @@ class PlanningNode(Node):
             top_indices = np.argsort(np.array([cost_function(trajectories[i], params[i], scores[i], self.target_pose) for i in range(len(trajectories))]), kind='stable')[:top_k]
             self.last_param = params[top_indices[0]]
 
-            # A clear curve wins outright: no library sample can both reach the goal
-            # and end on its heading, so competing on one cost would just hand it
-            # back to the arc that gets closest. Among curves least detour wins --
-            # they end at the same pose. All blocked, and the library's pick stands.
+            # A clear curve wins outright over the library; among curves, least
+            # detour wins since they all end at the same pose.
             selected_traj = trajectories[top_indices[0]]
             picked_curve = None
             if bezier_trajs is not None:
