@@ -136,7 +136,9 @@ class CmdVelControlNode(Node):
         max_dv = self.max_linear_acc * dt
         # If we just left reverse mode, do not let acceleration limiting leak another reverse command.
         prev_linear_x = 0.0 if self.prev_cmd.linear.x < 0.0 else self.prev_cmd.linear.x
-        out.linear.x = self._clamp_step(target_cmd.linear.x, prev_linear_x, max_dv)
+        stepped_x = self._clamp_step(target_cmd.linear.x, prev_linear_x, max_dv)
+        # Only range-clip here, at the final published values -- upstream vx/vyaw are raw.
+        out.linear.x = float(np.clip(stepped_x, 0.0, self.max_forward_speed))
         # Do not acceleration-limit yaw. The planner/control layer already decides the turn rate,
         # and forced rotate-in-place should take effect immediately.
         out.angular.z = float(np.clip(target_cmd.angular.z, -self.max_angular_speed, self.max_angular_speed))
@@ -198,29 +200,24 @@ class CmdVelControlNode(Node):
         r = R.from_matrix(T_robot_2_to_1[:3, :3])
         angular_velocity_vec = r.as_rotvec() / dt
 
+        # Raw, unclipped -- cmd_timer_callback range-clips right before publish.
         raw_vx = float(linear_velocity_vec[0])
-        if raw_vx < 0.0:
-            vx = -self.fixed_reverse_speed
-        else:
-            vx = float(np.clip(raw_vx, 0.0, self.max_forward_speed))
-        vy = 0.0
-        vyaw = np.clip(angular_velocity_vec[2], -self.max_angular_speed, self.max_angular_speed)
         is_backward_segment = raw_vx < 0.0
-        if is_backward_segment:
-            vyaw = 0.0
+        vx = -self.fixed_reverse_speed if is_backward_segment else raw_vx
+        vy = 0.0
+        vyaw = 0.0 if is_backward_segment else float(angular_velocity_vec[2])
 
         # Hack: if path first segment points >80 deg away from robot heading,
         # force an in-place turn. Skip explicit backward segments because reverse
         # naturally has heading_err close to +/-pi.
         if (not is_backward_segment) and abs(heading_err) > self.force_turn_heading_threshold:
             vx = 0.0
-            vyaw = float(np.clip(heading_err, -self.max_angular_speed, self.max_angular_speed))
-        # Minimal rotate-first gate: apply only for forward motion.
+            vyaw = heading_err
+        # Minimal rotate-first gate: apply only for forward motion. 0.6 caps this
+        # turn well below max_angular_speed -- deliberately gentler, not a safety clip.
         elif vx > 0.0 and abs(heading_err) > 0.45:
             vx = 0.0
             vyaw = float(np.clip(1.6 * heading_err, -0.6, 0.6))
-
-        vyaw = float(np.clip(vyaw, -self.max_angular_speed, self.max_angular_speed))
 
         # Store the latest target command directly. Smoothing is intentionally kept
         # only in cmd_timer_callback via acceleration limiting, so planner/control
