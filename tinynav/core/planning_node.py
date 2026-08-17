@@ -291,9 +291,8 @@ def end_yaw_error(traj_end, target_yaw):
 
 
 def target_yaw_from_msg(msg):
-    """The heading map_node put in a target pose, or None when it left one out.
-    A POI without one is published with an identity orientation, whose forward axis
-    is world +Z and so has no XY direction -- that is what tells the two apart."""
+    """Target heading from map_node, or None if the POI has none (identity
+    orientation, whose forward axis has no XY component)."""
     q = msg.pose.pose.orientation
     fwd_x = 2.0 * (q.x * q.z + q.w * q.y)
     fwd_y = 2.0 * (q.y * q.z - q.w * q.x)
@@ -368,12 +367,8 @@ class PlanningNode(Node):
         self.create_subscription(Odometry, '/control/target_pose', self.target_pose_callback, 10)
         self.target_pose = None
         self.target_yaw = None
-        # wider than map_node's ~0.5 m arrival radius, so the turn starts as the
-        # robot settles rather than after it has stopped
-        self.arrival_yaw_band = 0.8  # m
-        # inside the band the distance spread is a few cm, so this has to outweigh
-        # the 100/m distance term by a lot to decide anything
-        self.w_target_yaw = 800.0
+        self.arrival_yaw_band = 0.8  # m, wider than map_node's arrival radius
+        self.w_target_yaw = 800.0  # must dominate the 100/m distance term inside the band
 
         self.poi_change_sub = self.create_subscription(Odometry, "/mapping/poi_change", self.poi_change_callback, 10)
 
@@ -615,10 +610,7 @@ class PlanningNode(Node):
                 target_end = target_pose if target_pose is not None else traj_end
                 dist = np.linalg.norm(traj_end - target_end)
 
-                # Only from inside the arrival band: further out this fights the
-                # distance term and steers along the final heading instead of toward
-                # the goal. Inside it distance is nearly flat, and the vx=0 samples
-                # all share an endpoint, so heading alone picks the turn.
+                # Only near arrival, else it fights the distance term.
                 yaw_cost = 0.0
                 if (self.target_yaw is not None and target_pose is not None
                         and dist < self.arrival_yaw_band):

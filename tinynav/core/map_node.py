@@ -735,9 +735,7 @@ class MapNode(Node):
         target_position_in_odom = T[:3, :3] @ target_position + T[:3, 3]
         dummy_pose = np.eye(4)
         dummy_pose[:3, 3] = target_position_in_odom
-        # POI heading in the orientation, rotated into odom like the position is.
-        # Identity when it has none: forward is then world +Z, which projects to a
-        # zero XY heading, and that is the "no preference" signal.
+        # Rotate the POI heading into odom too; identity (no XY heading) if it has none.
         target_yaw = self.poi_yaws.get(self.poi_index)
         if target_yaw is not None:
             dummy_pose[:3, :3] = T[:3, :3] @ yaw_to_camera_rotation(target_yaw)

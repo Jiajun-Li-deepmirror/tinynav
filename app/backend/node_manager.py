@@ -712,9 +712,7 @@ class BackendNode(Ros2NodeManager):
         return len(self._load_poi_marks(bag_path))
 
     def record_poi_mark(self, name: str, timestamp_ns: int | None = None) -> dict:
-        """Mark a POI at the robot's current pose while a bag is recording. Stores the
-        live pose so the mark works without a map, and the timestamp so map build can
-        do better -- see _generate_pois_from_marks."""
+        """Mark a POI at the current live pose; timestamp lets map build correct it later."""
         clean_name = name.strip()
         if not clean_name:
             raise ValueError('POI name is required')
@@ -766,14 +764,8 @@ class BackendNode(Ros2NodeManager):
         return nearest_key, cls._pose_matrix(nearest_pose)
 
     def _generate_pois_from_marks(self, bag_path: str | None, map_path: str) -> bool:
-        """Turn the recording's POI marks into the map's pois.json.
-
-        A mark's live pose is in the odometry frame at record time, which loop closure
-        later corrects. Its timestamp finds the nearest keyframe, whose correction is
-        replayed onto it as optimized_keyframe @ inv(raw_keyframe) @ raw_mark, so a
-        mark laid down before a loop closes still lands right. Falls back to the live
-        capture when the map lacks the pose files for that.
-        """
+        """Write pois.json from bag marks, replaying loop-closure correction onto each
+        mark via its nearest keyframe. Falls back to the live pose if poses are missing."""
         if bag_path is None:
             return False
         marks = self._load_poi_marks(bag_path)
@@ -1144,9 +1136,7 @@ class BackendNode(Ros2NodeManager):
         shutil.move(self.map_path, dest)
         os.symlink(dest, self.map_path)
 
-        # POI marks from the recording win: they are real places the operator
-        # stood at, with a heading. Only when there are none does the origin
-        # placeholder below apply.
+        # Bag marks win; the origin placeholder is only a fallback.
         if not self._generate_pois_from_marks(active_bag, dest):
             # Auto-create a home POI at the SLAM origin (0,0,0) if none exist.
             # map_node requires at least one POI as a global localization anchor.
