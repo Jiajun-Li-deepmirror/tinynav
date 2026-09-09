@@ -563,7 +563,13 @@ def _match_keypoints(
     image_shape1: np.ndarray,
     *,
     loop: asyncio.AbstractEventLoop | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Returns (keypoints0, keypoints1, descriptors1, match_scores) for matched pairs.
+
+    descriptors1/match_scores are the matched keypoint's own SuperPoint descriptor and
+    LightGlue confidence, kept alongside the coordinates for keypoint-level dataset export
+    (see _export_keypoint_dataset_sample) — not used by the diagnostics-only path.
+    """
     own_loop = loop is None
     if own_loop:
         loop = asyncio.new_event_loop()
@@ -587,7 +593,14 @@ def _match_keypoints(
     valid_mask = match_indices != -1
     keypoints0 = feats0["kpts"][0][valid_mask]
     keypoints1 = feats1["kpts"][0][match_indices[valid_mask]]
-    return np.asarray(keypoints0), np.asarray(keypoints1)
+    descriptors1 = feats1["descps"][0][match_indices[valid_mask]]
+    match_scores = result["score"][0][valid_mask]
+    return (
+        np.asarray(keypoints0),
+        np.asarray(keypoints1),
+        np.asarray(descriptors1),
+        np.asarray(match_scores),
+    )
 
 
 def _keypoints_to_world(
@@ -751,6 +764,73 @@ def _trial_loop_quality(candidate: dict) -> float:
     )
 
 
+def _export_keypoint_dataset_sample(
+    *,
+    dataset_dir: Path,
+    sample_id: str,
+    query_image: np.ndarray,
+    reference_image: np.ndarray,
+    query_kpts: np.ndarray,
+    reference_kpts: np.ndarray,
+    query_descriptors: np.ndarray,
+    match_scores: np.ndarray,
+    depth_values: np.ndarray,
+    landmark_positions: np.ndarray,
+    inlier_indices: np.ndarray,
+    pnp_success: bool,
+    pose_error_to_eval_pose_m: float | None,
+    good_threshold_m: float,
+    meta: dict,
+) -> None:
+    """Writes one (eval frame, retrieval candidate) sample for confidence-model training.
+
+    One sample = one candidate, not one eval frame with 3 bundled references: each
+    candidate's inliers are labeled from that candidate's OWN pose error against the true
+    eval pose (not whichever candidate the production pipeline happened to fuse), so a
+    sample has to carry its own single reference image and keypoint set to stay self-
+    consistent with its labels.
+
+    query_kpts/reference_kpts/query_descriptors/match_scores/depth_values/landmark_positions
+    must all already be restricted to the same depth-valid subset inlier_indices indexes into
+    (see the caller) — points without depth can't be PnP inliers and carry no label here.
+    """
+    sample_dir = dataset_dir / "samples" / sample_id
+    sample_dir.mkdir(parents=True, exist_ok=True)
+
+    cv2.imwrite(str(sample_dir / "query.png"), _to_bgr(query_image))
+    cv2.imwrite(str(sample_dir / "reference.png"), _to_bgr(reference_image))
+
+    is_inlier = np.zeros(len(query_kpts), dtype=bool)
+    is_inlier[inlier_indices] = True
+    if pnp_success and pose_error_to_eval_pose_m is not None:
+        reliable = pose_error_to_eval_pose_m < good_threshold_m
+        labels = np.where(is_inlier, 1 if reliable else 0, -1)
+    else:
+        labels = np.full(len(query_kpts), -1, dtype=np.int64)
+
+    np.save(sample_dir / "query_keypoints.npy", query_kpts.astype(np.float32))
+    np.save(sample_dir / "reference_keypoints.npy", reference_kpts.astype(np.float32))
+    np.save(sample_dir / "query_descriptors.npy", query_descriptors.astype(np.float32))
+    np.save(sample_dir / "match_scores.npy", match_scores.astype(np.float32))
+    np.save(sample_dir / "depth_values_m.npy", depth_values.astype(np.float32))
+    np.save(sample_dir / "landmark_positions_m.npy", landmark_positions.astype(np.float32))
+    np.save(sample_dir / "labels.npy", labels.astype(np.int8))
+
+    (sample_dir / "meta.json").write_text(json.dumps({
+        **meta,
+        "pnp_success": bool(pnp_success),
+        "pose_error_to_eval_pose_m": pose_error_to_eval_pose_m,
+        "good_threshold_m": good_threshold_m,
+        "num_matches": int(len(query_kpts)),
+        "num_inliers": int(len(inlier_indices)),
+        "label_meaning": {
+            "1": "PnP inlier from a candidate whose pose matched the true eval pose",
+            "0": "PnP inlier from a candidate whose pose did not match the true eval pose",
+            "-1": "not a PnP inlier (or PnP failed for this candidate) - ignore",
+        },
+    }, indent=2))
+
+
 def _draw_match_image(
     ref_image: np.ndarray,
     query_image: np.ndarray,
@@ -789,6 +869,8 @@ def _compute_retrieval_diagnostics(
     top_k: int,
     min_inliers: int,
     max_lines: int,
+    dataset_dir: Path | None = None,
+    dataset_good_threshold_m: float = 0.3,
 ) -> list[dict]:
     from tinynav.core.build_map_node import TinyNavDB, find_loop
     from tinynav.core.models_trt import LightGlueTRT
@@ -833,7 +915,7 @@ def _compute_retrieval_diagnostics(
                 gt_depth, _, gt_features, _, gt_image_loader = gt_db.get_depth_embedding_features_images(gt_ts)
                 gt_image = gt_image_loader()
                 gt_image_shape = _image_shape_wh(gt_image)
-                ref_kpts_all, query_kpts_all = _match_keypoints(
+                ref_kpts_all, query_kpts_all, query_descriptors_all, match_scores_all = _match_keypoints(
                     matcher, gt_features, eval_features, gt_image_shape, eval_image_shape, loop=loop
                 )
                 points_world, depth_valid = _keypoints_to_world(ref_kpts_all, gt_depth, gt_poses[gt_ts], gt_K)
@@ -841,6 +923,9 @@ def _compute_retrieval_diagnostics(
                 points_world_valid = points_world[depth_valid].astype(np.float32)
                 depth_values_valid = depth_values_all[depth_valid]
                 query_valid = query_kpts_all[depth_valid].astype(np.float32)
+                ref_valid = ref_kpts_all[depth_valid].astype(np.float32)
+                query_descriptors_valid = query_descriptors_all[depth_valid]
+                match_scores_valid = match_scores_all[depth_valid]
                 success, pose_camera_to_world, pnp_inliers = _pnp_pose(
                     points_world_valid,
                     query_valid,
@@ -904,6 +989,32 @@ def _compute_retrieval_diagnostics(
                 }
                 candidate_row["trial_loop_quality"] = _trial_loop_quality(candidate_row)
                 candidate_rows.append(candidate_row)
+
+                if dataset_dir is not None and len(query_valid) > 0:
+                    _export_keypoint_dataset_sample(
+                        dataset_dir=dataset_dir,
+                        sample_id=f"{eval_ts}_{gt_ts}",
+                        query_image=eval_image,
+                        reference_image=gt_image,
+                        query_kpts=query_valid,
+                        reference_kpts=ref_valid,
+                        query_descriptors=query_descriptors_valid,
+                        match_scores=match_scores_valid,
+                        depth_values=depth_values_valid,
+                        landmark_positions=points_world_valid,
+                        inlier_indices=pnp_inliers,
+                        pnp_success=success,
+                        pose_error_to_eval_pose_m=(
+                            float(np.linalg.norm(expected_delta)) if expected_delta is not None else None
+                        ),
+                        good_threshold_m=dataset_good_threshold_m,
+                        meta={
+                            "eval_timestamp_ns": int(eval_ts),
+                            "reference_timestamp_ns": int(gt_ts),
+                            "retrieval_rank": rank,
+                            "retrieval_similarity": float(sim),
+                        },
+                    )
 
             rows.append(
                 {
@@ -1301,19 +1412,34 @@ def run(args: argparse.Namespace) -> Path:
     _plot_error_curve(errors, output_dir / "translation_rotation_error.png")
     _plot_xyz_error_curve(errors, output_dir / "xyz_error.png")
     retrieval_diagnostics = None
-    if not args.disable_retrieval_diagnostics:
-        print("\nExtra: computing retrieval/PnP diagnostics for largest errors")
+    if not args.disable_retrieval_diagnostics or args.export_keypoint_dataset:
+        # Exporting the keypoint dataset needs PnP run over far more samples than the
+        # HTML report's worst-error diagnostics do, so it can see both good and bad
+        # candidates rather than only the worst ones. Both reuse the same retrieval/PnP
+        # work, so run it once at whichever sample count the enabled use(s) need.
+        sample_count = args.retrieval_diagnostic_samples
+        if args.export_keypoint_dataset:
+            sample_count = max(sample_count, min(len(errors), args.keypoint_dataset_max_samples))
+        dataset_dir = None
+        if args.export_keypoint_dataset:
+            dataset_dir = Path(args.keypoint_dataset_dir) if args.keypoint_dataset_dir else output_dir / "relocalization_confidence_dataset"
+            dataset_dir.mkdir(parents=True, exist_ok=True)
+        print("\nExtra: computing retrieval/PnP diagnostics" + (" and keypoint dataset" if dataset_dir else ""))
         retrieval_diagnostics = _compute_retrieval_diagnostics(
             map_gt_dir=map_gt_dir,
             map_eval_dir=map_eval_dir,
             output_dir=output_dir,
             errors=errors,
             transform_map_eval_to_gt=transform_map_eval_to_gt,
-            sample_count=args.retrieval_diagnostic_samples,
+            sample_count=sample_count,
             top_k=args.retrieval_diagnostic_top_k,
             min_inliers=args.retrieval_diagnostic_min_inliers,
             max_lines=args.retrieval_diagnostic_max_lines,
+            dataset_dir=dataset_dir,
+            dataset_good_threshold_m=args.keypoint_dataset_good_threshold_m,
         )
+        if args.disable_retrieval_diagnostics:
+            retrieval_diagnostics = None  # computed only to drive the dataset export, not the HTML report
     _write_html_report(output_dir, metrics, errors, retrieval_diagnostics)
 
     print(f"\nBenchmark complete: {output_dir / 'index.html'}")
@@ -1387,6 +1513,29 @@ def main():
         type=int,
         default=80,
         help="Maximum PnP inlier match lines drawn per diagnostic image",
+    )
+    parser.add_argument(
+        "--export-keypoint-dataset",
+        action="store_true",
+        help="Export per-keypoint PnP inlier/outlier samples for confidence-model training "
+             "(reuses the same retrieval/PnP work as the diagnostics, run over more samples)",
+    )
+    parser.add_argument(
+        "--keypoint-dataset-dir",
+        help="Output directory for the keypoint dataset (default: <output_dir>/relocalization_confidence_dataset)",
+    )
+    parser.add_argument(
+        "--keypoint-dataset-max-samples",
+        type=int,
+        default=200,
+        help="Max evaluated poses to run retrieval/PnP over when exporting the keypoint dataset",
+    )
+    parser.add_argument(
+        "--keypoint-dataset-good-threshold-m",
+        type=float,
+        default=0.3,
+        help="A candidate's PnP inliers are labeled reliable (1) if its pose error to the true "
+             "eval pose is below this, unreliable (0) otherwise; non-inliers are labeled -1",
     )
     run(parser.parse_args())
 
